@@ -2,7 +2,7 @@
 #define _DEFAULT_SOURCE
 #endif
 
-#define VERSION_STR "1.0"
+#define VERSION_STR "2.0"
 
 #include <stdlib.h>
 #include <stdio.h>
@@ -12,20 +12,24 @@
 #include <arpa/inet.h>
 #include <string.h>
 #include <stdbool.h>
+#include <net/if.h>
+#include <linux/sockios.h>
+#include <linux/net_tstamp.h>
+#include <errno.h>
+#include <sys/ioctl.h>
 
 // See 'man clock_gettime'
 #define CLOCKFD 3
 #define FD_TO_CLOCKID(fd)   ((~(clockid_t) (fd) << 3) | CLOCKFD)
 #define CLOCKID_TO_FD(clk)  ((unsigned int) ~((clk) >> 3))
 
+#define RTP_BUF_SIZE 64 // 64 bytes is enough to get timestamp
+
 // Print every PRINT_FREQ packet
 #define PRINT_FREQ 100
 
-#define BUF_SIZE 64
-unsigned char buf[BUF_SIZE];
-
 struct Settings {
-    char* ptp_device;
+    char* ifname;
     char* stream_address;
     int stream_port;
     int sample_rate;
@@ -34,8 +38,8 @@ struct Settings {
 
 #define HISTOGRAM_BOXES 11
 #define HISTOGRAM_WIDTH 40
-long histogram[HISTOGRAM_BOXES];
-long histogram_scale = 0;
+unsigned long histogram[HISTOGRAM_BOXES];
+unsigned long histogram_scale = 0;
 
 uint32_t recvr_timestamp = 0;
 uint32_t sender_timestamp = 0;
@@ -45,17 +49,17 @@ double peak_latency = 0; // in usec
 
 long packet_count = 0;
 long late_packets = 0;
+long early_packets = 0;
 
 void print_help_and_exit() {
     printf(
-        "AES67 Network Latency Analyzer v" VERSION_STR "\n\n"
-        "Measures the difference between the RTP timestamps and the current PTP time.\n"
+        "AES67 Latency Analyzer v" VERSION_STR "\n\n"
+        "Measures the difference between the RTP timestamps and the packet arrival times.\n"
         "The computer running this software and the AES67 sender must be synchronized\n"
         "to the same PTP grandmaster clock.\n\n"
-        "If no PTP device is specified, the latency is instead calculated as the\n"
-        "time between packets. No PTP synchronization is required in this case.\n\n"
+        "Note that SO_TIMESTAMPING requires root privileges.\n\n"
         "Options:\n"
-        "  -d [PTP device]                (e.g., /dev/ptp0)\n"
+        "  -i [Network interface]         (e.g., enp86s0)\n"
         "  -a [Multicast stream address]  (e.g., 239.69.1.2)\n"
         "  -p [Stream port]               (default 5004)\n"
         "  -r [Sample rate]               (default 48000)\n"
@@ -65,17 +69,17 @@ void print_help_and_exit() {
 }
 
 void parse_args(int argc, char* argv[]) {
-    settings.ptp_device = NULL;
+    settings.ifname = NULL;
     settings.stream_address = NULL;
     settings.stream_port = 5004;
     settings.sample_rate = 48000;
     settings.max_latency = 2000;
 
     char c;
-    while ((c = getopt(argc, argv, ":d:a:p:r:s:h")) != -1) {
+    while ((c = getopt(argc, argv, ":i:a:p:r:s:h")) != -1) {
         switch (c) {
-            case 'd':
-                settings.ptp_device = optarg;
+            case 'i':
+                settings.ifname = optarg;
                 break;
             case 'a':
                 settings.stream_address = optarg;
@@ -103,6 +107,10 @@ void parse_args(int argc, char* argv[]) {
                 break;
         }
     }
+    if (settings.ifname == NULL) {
+        fprintf(stderr, "No interface name (-i) specified\n");
+        exit(1);
+    }
     if (settings.stream_address == NULL) {
         fprintf(stderr, "No stream address (-a) specified\n");
         exit(1);
@@ -119,14 +127,17 @@ void parse_args(int argc, char* argv[]) {
 
 void print_headers() {
     printf("\033[H\033[J");
-    printf("AES67 Network Latency Analyzer v" VERSION_STR "\n\n");
+    printf("AES67 Latency Analyzer v" VERSION_STR "\n\n");
     printf("Stream: %s:%d\n", settings.stream_address, settings.stream_port);
     printf("Sample rate: %d Hz\n", settings.sample_rate);
-    printf("PTP device: %s\n", settings.ptp_device != NULL ? settings.ptp_device : "None");
+    printf("Interface: %s\n", settings.ifname);
     printf("Setting: %d usec\n\n", settings.max_latency);
 }
 
 void update_histogram() {
+    if (latency < 0) {
+        return;
+    }
     if (latency >= settings.max_latency) {
         if (++histogram[HISTOGRAM_BOXES - 1] > histogram_scale) {
             histogram_scale++;
@@ -154,6 +165,7 @@ void print_histogram() {
         while (size-- > 0) {
             putchar('=');
         }
+        printf(" %lu", histogram[i]);
         putchar('\n');
     }
 }
@@ -164,10 +176,10 @@ void print_vars() {
     printf("Peak latency: %f usec\n", peak_latency);
     printf("Packets: %ld\n", packet_count);
     printf("Late packets: %ld\n", late_packets);
+    printf("Early packets: %ld\n", early_packets);
 }
 
-int open_socket(struct sockaddr_in* addr) {
-    struct ip_mreq mreq;
+int open_socket() {
     int fd;
 
     if ((fd = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
@@ -175,29 +187,55 @@ int open_socket(struct sockaddr_in* addr) {
         return -1;
     }
 
+    // Enable SO_REUSEADDR on the socket
     int reuse = 1;
     if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (char *)&reuse, sizeof(reuse)) < 0) {
-        perror("setsockopt SO_REUSEADDR");
+        perror("Could not set SO_REUSEADDR");
         close(fd);
         return -1;
     }
 
-    memset((char *)addr, 0, sizeof(*addr));
-    addr->sin_family = AF_INET;
-    addr->sin_addr.s_addr = htonl(INADDR_ANY);
-    addr->sin_port = htons(settings.stream_port);
+    // Enable RX hardware timestamping
+    struct ifreq ifr;
+    struct hwtstamp_config hwts_config;
+    memset(&hwts_config, 0, sizeof(hwts_config));
+    hwts_config.tx_type = HWTSTAMP_TX_OFF;
+    hwts_config.rx_filter = HWTSTAMP_FILTER_ALL;
+    memset(&ifr, 0, sizeof(ifr));
+    snprintf(ifr.ifr_name, IFNAMSIZ, "%s", settings.ifname);
+    ifr.ifr_data = (void *)&hwts_config;
+    if (ioctl(fd, SIOCSHWTSTAMP, &ifr) == -1) {
+        perror("Could not enable hardware timestamping");
+        close(fd);
+        return -1;
+    }
 
-    if (bind(fd, (struct sockaddr *)addr, sizeof(*addr)) < 0) {
+    // Bind socket to configured 
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_port = htons(settings.stream_port);
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         perror("Socket bind failed");
         close(fd);
         return -1;
     }
 
+    // Enable timestamp reporting
+    int reporting = SOF_TIMESTAMPING_RAW_HARDWARE;
+    if (setsockopt(fd, SOL_SOCKET, SO_TIMESTAMPING, &reporting, sizeof(reporting)) == -1) {
+        perror("Could not enable timestamp reporting");
+        close(fd);
+        return -1;
+    }
+
+    // Join multicast
+    struct ip_mreq mreq;
     mreq.imr_multiaddr.s_addr = inet_addr(settings.stream_address);
     mreq.imr_interface.s_addr = htonl(INADDR_ANY);
-
     if (setsockopt(fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, (char *)&mreq, sizeof(mreq)) < 0) {
-        perror("setsockopt IP_ADD_MEMBERSHIP");
+        perror("Could not join multicast");
         close(fd);
         return -1;
     }
@@ -205,9 +243,11 @@ int open_socket(struct sockaddr_in* addr) {
 }
 
 void update_latency() {
-    latency = (double)(recvr_timestamp - sender_timestamp) / (double)settings.sample_rate * 1e6;
+    latency = (double)((int32_t)recvr_timestamp - (int32_t)sender_timestamp) / (double)settings.sample_rate * 1e6;
     if (latency > settings.max_latency) {
         late_packets++;
+    } else if (latency < 0) {
+        early_packets++;
     }
     if (latency > peak_latency) {
         peak_latency = latency;
@@ -218,54 +258,46 @@ int main(int argc, char* argv[]) {
     setbuf(stdout, NULL); // Disable buffering to avoid flickering
     parse_args(argc, argv);
 
-    int clk_fd = -1;
-    clockid_t clk_id = CLOCK_MONOTONIC;
-    
-    if (settings.ptp_device != NULL) {
-        clk_fd = open(settings.ptp_device, O_RDONLY);
-
-        if (clk_fd < 0) {
-            perror("Could not open PTP device");
-            return 1;
-        }
-        clk_id = FD_TO_CLOCKID(clk_fd);
-    }
-
-    struct sockaddr_in addr;
-    unsigned int addrlen = sizeof(addr);
-    int sock_fd = open_socket(&addr);
+    int sock_fd = open_socket();
 
     if (sock_fd < 0) {
         return 1;
     }
 
+    char data[RTP_BUF_SIZE], ctrl[4096];
+    struct msghdr hdr;
+    struct iovec iov;
+    struct cmsghdr *cmsg;
+
+    memset(&hdr, 0, sizeof(hdr));
+    hdr.msg_iov = &iov;
+    hdr.msg_iovlen = 1;
+    hdr.msg_control = ctrl;
+    hdr.msg_controllen = sizeof(ctrl);
+    iov.iov_base = data;
+    iov.iov_len = sizeof(data);
+
     int print_timer = 0;
-    bool first_run = true;
 
     printf("Waiting for first packet(s)...\n");
 
     for (;;) {
-        int recvd = recvfrom(sock_fd, buf, BUF_SIZE, 0, (struct sockaddr *)&addr, &addrlen);
+        int recvd = recvmsg(sock_fd, &hdr, 0);
 
-        if (recvd < BUF_SIZE)
+        if (recvd < RTP_BUF_SIZE) // Not enough data to get RTP timestamp
             continue;
 
-        struct timespec ts;
-
-        if (clock_gettime(clk_id, &ts) == -1) {
-            perror("clock_gettime");
-            return 1;
+        // Timestamp is found in control message
+        for (cmsg = CMSG_FIRSTHDR(&hdr); cmsg != NULL; cmsg = CMSG_NXTHDR(&hdr, cmsg)) {
+            if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_TIMESTAMPING) {
+                struct timespec *ts = (struct timespec *)CMSG_DATA(cmsg);
+                // RTP timestamp "unit" is 1/sample_rate seconds
+                recvr_timestamp = (ts[2].tv_sec + ts[2].tv_nsec / 1e9) * settings.sample_rate;
+            }
         }
-        uint32_t prev_recvr_timestamp = recvr_timestamp;
 
-        // RTP timestamp "unit" is 1/sample_rate seconds
-        recvr_timestamp = (ts.tv_sec + ts.tv_nsec / 1e9) * settings.sample_rate;
-        
-        if (settings.ptp_device != NULL) {
-            sender_timestamp = ntohl(*(uint32_t*)(buf + 4)); // Get timestamp from RTP header
-        } else {
-            sender_timestamp = first_run ? recvr_timestamp : prev_recvr_timestamp;
-        }
+        // Get timestamp from RTP header
+        sender_timestamp = ntohl(*(uint32_t*)(data + 4));
 
         packet_count++;
         update_latency();
@@ -277,7 +309,6 @@ int main(int argc, char* argv[]) {
             print_vars();
             print_timer = 0;
         }
-        first_run = false;
     }
     return 0;
 }
