@@ -2,7 +2,7 @@
 #define _DEFAULT_SOURCE
 #endif
 
-#define VERSION_STR "2.1"
+#define VERSION_STR "2.2"
 
 #include <stdlib.h>
 #include <stdio.h>
@@ -252,6 +252,14 @@ int open_socket(struct settings* settings) {
         return -1;
     }
 
+    // Enable multicast address reporting
+    int addr_report = 1;
+    if (setsockopt(fd, IPPROTO_IP, IP_PKTINFO, &addr_report, sizeof(addr_report)) == -1) {
+        perror("Could not enable multicast address reporting");
+        close(fd);
+        return -1;
+    }
+
     // Join multicast
     struct ip_mreq mreq;
     mreq.imr_multiaddr.s_addr = inet_addr(settings->stream_address);
@@ -375,6 +383,7 @@ int main(int argc, char* argv[]) {
     }
 
     char data[RTP_BUF_SIZE], ctrl[4096];
+    char src_addr[INET_ADDRSTRLEN];
     struct msghdr hdr;
     struct iovec iov;
     struct cmsghdr *cmsg;
@@ -397,23 +406,34 @@ int main(int argc, char* argv[]) {
         if (recvd < RTP_BUF_SIZE) // Not enough data to get RTP timestamp
             continue;
 
-        state.prev_recvr_ts = state.recvr_ts;
+        uint32_t new_recvr_ts = 0;
 
-        // Timestamp is found in control message
         for (cmsg = CMSG_FIRSTHDR(&hdr); cmsg != NULL; cmsg = CMSG_NXTHDR(&hdr, cmsg)) {
             if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_TIMESTAMPING) {
                 struct timespec *ts = (struct timespec *)CMSG_DATA(cmsg);
 
-                state.recvr_ts = (ts[2].tv_sec + ts[2].tv_nsec / 1e9) * state.settings.sample_rate;
-                if (first_run) {
-                    state.prev_recvr_ts = state.recvr_ts;
-                    first_run = false;
-                }
-            } else {
-                fprintf(stderr, "Could not get HW timestamp for packet");
-                return 1;
+                // Found receiver timestamp
+                new_recvr_ts = (ts[2].tv_sec + ts[2].tv_nsec / 1e9) * state.settings.sample_rate;
+
+            } else if (cmsg->cmsg_level == IPPROTO_IP && cmsg->cmsg_type == IP_PKTINFO) {
+                struct in_pktinfo *pktinfo = (struct in_pktinfo *)CMSG_DATA(cmsg);
+
+                // Found multicast address
+                inet_ntop(AF_INET, &pktinfo->ipi_addr, src_addr, sizeof(src_addr));
             }
         }
+
+        // Ignore packets not going to settings.stream_address
+        if (strcmp(src_addr, state.settings.stream_address))
+            continue;
+
+        if (first_run) {
+            state.prev_recvr_ts = new_recvr_ts;
+            first_run = false;
+        } else {
+            state.prev_recvr_ts = state.recvr_ts;
+        }
+        state.recvr_ts = new_recvr_ts;
 
         // Get timestamp from RTP header
         state.sender_ts = ntohl(*(uint32_t*)(data + 4));
